@@ -1,0 +1,299 @@
+import os
+import time
+import math
+import threading
+import pandas as pd
+from datetime import datetime, timedelta
+from binance.client import Client
+from binance.enums import *
+
+# ====== CONFIG ======
+API_KEY = os.getenv("BINANCE_API_KEY") or "" #BINANCE_API_KEY should be replaced with actual api key produced by binance 
+API_SECRET = os.getenv("BINANCE_API_SECRET") or "" #BINANCE_API_SECRET should be replaced with actual binance secrete api key produced by binance
+
+SYMBOLS = ["XRPUSDT", "1000PEPEUSDT"]
+TIMEFRAME = "15m"
+LEVERAGE = 25
+RISK_PERCENT = 0.25  # fraction of balance used (25% -> 0.25)
+MIN_NOTIONAL_USD = 5.0
+
+# Indicator parameters
+RSI_PERIOD = 7
+EMA_SHORT = 9
+EMA_LONG = 21
+MACD_SHORT = 5
+MACD_LONG = 13
+
+
+client = Client(API_KEY, API_SECRET)
+client.timestamp_auto_sync = True
+
+print("🔄 Syncing with Binance server time...")
+try:
+    client.get_exchange_info()  # simple call to validate connection/time
+    time.sleep(1)
+except Exception as e:
+    print("⛔ Time sync / exchange_info failed:", e)
+    raise SystemExit(1)
+
+# set leverage for each symbol
+for s in SYMBOLS:
+    try:
+        client.futures_change_leverage(symbol=s, leverage=LEVERAGE)
+        print(f"[{s}] ✅ Leverage set to {LEVERAGE}x")
+    except Exception as e:
+        print(f"[{s}] ❌ Leverage error:", e)
+
+# fetch symbol info for precision/step
+try:
+    exchange_info = client.futures_exchange_info()
+    symbol_info = {it["symbol"]: it for it in exchange_info["symbols"] if it["symbol"] in SYMBOLS}
+except Exception as e:
+    print("❌ Failed to fetch futures_exchange_info:", e)
+    raise SystemExit(1)
+
+# state
+last_signals = {s: None for s in SYMBOLS}
+last_candle_time = {s: None for s in SYMBOLS}
+
+# ====== INDICATORS & DATA ======
+def rsi_series(close_series, length=RSI_PERIOD):
+    delta = close_series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(window=length).mean()
+    avg_loss = loss.rolling(window=length).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def compute_indicators(df):
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df["EMA_short"] = df["close"].ewm(span=EMA_SHORT, adjust=False).mean()
+    df["EMA_long"] = df["close"].ewm(span=EMA_LONG, adjust=False).mean()
+    df["RSI"] = rsi_series(df["close"], RSI_PERIOD)
+    df["MACD"] = df["close"].ewm(span=MACD_SHORT, adjust=False).mean() - df["close"].ewm(span=MACD_LONG, adjust=False).mean()
+    return df
+
+def get_klines(symbol, limit=100):
+    try:
+        klines = client.futures_klines(symbol=symbol, interval=TIMEFRAME, limit=limit)
+        df = pd.DataFrame(klines, columns=[
+            "open_time","open","high","low","close","volume",
+            "close_time","quote_av","trades","tb_base_av","tb_quote_av","ignore"
+        ])
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+        df = compute_indicators(df)
+        return df
+    except Exception as e:
+        print(f"[{symbol}] ❌ Error fetching klines: {e}")
+        return pd.DataFrame()
+
+# ====== POSITION & ORDER HELPERS ======
+def get_position_side(symbol):
+    try:
+        positions = client.futures_position_information(symbol=symbol)
+        # futures_position_information(symbol=...) may return a list with single element
+        if isinstance(positions, list) and len(positions) > 0:
+            pos = positions[0]
+        else:
+            pos = positions
+        amt = float(pos.get("positionAmt", 0))
+        if amt > 0:
+            return "long"
+        elif amt < 0:
+            return "short"
+        else:
+            return None
+    except Exception as e:
+        # fallback scanning all positions if above didn't work
+        try:
+            positions = client.futures_position_information()
+            for p in positions:
+                if p["symbol"] == symbol:
+                    amt = float(p.get("positionAmt", 0))
+                    if amt > 0: return "long"
+                    elif amt < 0: return "short"
+            return None
+        except Exception as ee:
+            print(f"[{symbol}] ❌ Position error: {ee}")
+            return None
+
+def get_step_and_precision(symbol):
+    try:
+        info = symbol_info[symbol]
+        lot = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+        step = float(lot["stepSize"])
+        # determine decimal precision for rounding/truncation
+        if step >= 1:
+            precision = 0
+        else:
+            precision = max(0, int(round(-math.log10(step))))
+        return step, precision
+    except Exception as e:
+        # sensible default
+        return 0.0001, 4
+
+def get_trade_quantity(symbol):
+    try:
+        # find USDT balance entry (safest)
+        balance_list = client.futures_account_balance()
+        usdt_obj = next((b for b in balance_list if b["asset"] == "USDT"), None)
+        if usdt_obj is None:
+            # fallback to index 0 frequently default
+            usdt = float(balance_list[0]["balance"])
+        else:
+            usdt = float(usdt_obj["balance"])
+        available = usdt * RISK_PERCENT * LEVERAGE
+        price = float(client.futures_mark_price(symbol=symbol)["markPrice"])
+        raw_qty = available / price
+        step, precision = get_step_and_precision(symbol)
+        # floor to step (avoid placing greater than allowed)
+        if precision == 0:
+            qty = math.floor(raw_qty)
+        else:
+            factor = 10 ** precision
+            qty = math.floor(raw_qty * factor) / factor
+        # ensure qty respects step (safety)
+        if step > 0:
+            qty = math.floor(qty / step) * step
+        # handle tiny qty
+        if qty <= 0:
+            return 0
+        # round to precision for API
+        return round(qty, precision)
+    except Exception as e:
+        print(f"[{symbol}] ❌ Quantity error: {e}")
+        return 0
+
+def place_market_order(symbol, side, qty):
+    try:
+        if qty <= 0:
+            print(f"[{symbol}] ⚠️ Calculated qty {qty} invalid, skipping order")
+            return None
+        res = client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type=ORDER_TYPE_MARKET,
+            quantity=qty
+        )
+        print(f"[{symbol}] ✅ Market order placed: {side} {qty}")
+        return res
+    except Exception as e:
+        print(f"[{symbol}] ❌ Order failed: {e}")
+        return None
+
+# ====== TRADE LOGIC ======
+def evaluate_and_trade(symbol):
+    global last_signals, last_candle_time
+
+    df = get_klines(symbol)
+    if df.empty or len(df) < 30:
+        print(f"[{symbol}] ⏸️ Not enough data")
+        return
+
+    last_row = df.iloc[-1]
+    candle_time = last_row["open_time"]
+    # skip duplicate candle processing
+    if last_candle_time[symbol] == candle_time:
+        # already processed this closed candle
+        return
+
+    # indicators
+    ema_short = last_row["EMA_short"]
+    ema_long = last_row["EMA_long"]
+    rsi = last_row["RSI"]
+    macd = last_row["MACD"]
+
+    if any(pd.isna([ema_short, ema_long, rsi, macd])):
+        print(f"[{symbol}] ⏸️ Indicators not ready")
+        return
+
+    # current positions and sizing
+    try:
+        price = float(client.futures_mark_price(symbol=symbol)["markPrice"])
+    except Exception as e:
+        print(f"[{symbol}] ❌ Price error: {e}")
+        return
+
+    qty = get_trade_quantity(symbol)
+    notional = qty * price
+
+    print(f"[{symbol}] 📊 {candle_time} Price: {price:.6f} | EMA9: {ema_short:.6f} EMA21: {ema_long:.6f} RSI: {rsi:.2f} MACD: {macd:.6f} Qty:{qty}")
+
+    if notional < MIN_NOTIONAL_USD:
+        print(f"[{symbol}] ⚠️ Notional ${notional:.2f} < ${MIN_NOTIONAL_USD} — skipping")
+        last_candle_time[symbol] = candle_time
+        return
+
+    position = get_position_side(symbol)
+
+    # Entry logic (based on closed candle)
+    # long condition
+    if ema_short > ema_long and rsi > 50 and macd > 0 and last_signals[symbol] != "long":
+        if position == "short":
+            # close short and open long: buy double qty (approx)
+            place_market_order(symbol, SIDE_BUY, round(qty * 2, 8))
+        elif position is None:
+            place_market_order(symbol, SIDE_BUY, qty)
+        last_signals[symbol] = "long"
+        last_candle_time[symbol] = candle_time
+
+    # short condition
+    elif ema_short < ema_long and rsi < 50 and macd < 0 and last_signals[symbol] != "short":
+        if position == "long":
+            place_market_order(symbol, SIDE_SELL, round(qty * 2, 8))
+        elif position is None:
+            place_market_order(symbol, SIDE_SELL, qty)
+        last_signals[symbol] = "short"
+        last_candle_time[symbol] = candle_time
+
+    else:
+        # no new signal: still mark processed candle so we don't re-evaluate
+        last_candle_time[symbol] = candle_time
+
+# ====== CANDLE SCHEDULER (run once per closed TF candle) ======
+def wait_for_next_candle(interval_minutes=15):
+    now = datetime.utcnow()
+    # compute minutes to next candle boundary
+    minutes = now.minute
+    seconds = now.second
+    wait_minutes = interval_minutes - (minutes % interval_minutes)
+    # If exactly at boundary but seconds>0, we need full interval
+    if seconds == 0 and wait_minutes == interval_minutes:
+        wait_seconds = 0
+    else:
+        target = (now.replace(second=0, microsecond=0) + timedelta(minutes=wait_minutes))
+        wait_seconds = (target - now).total_seconds()
+    return wait_seconds
+
+# optional: periodic forced time sync (every 3 hours)
+def periodic_time_sync(interval_hours=3):
+    while True:
+        try:
+            client.get_server_time()
+            print("[TIME SYNC] Forced server time check OK")
+        except Exception as e:
+            print("[TIME SYNC] Forced sync failed:", e)
+        time.sleep(interval_hours * 3600)
+
+# ====== MAIN LOOP ======
+if __name__ == "__main__":
+    # start time sync thread
+    t = threading.Thread(target=periodic_time_sync, daemon=True)
+    t.start()
+
+    print("🚀 Starting REST-only Binance Futures bot (15m TF)...")
+    while True:
+        wait = wait_for_next_candle(15)
+        if wait > 0:
+            print(f"⏳ Waiting {int(wait)}s for next 15m candle close...")
+            time.sleep(wait + 1)  # small buffer to ensure candle closed
+
+        for sym in SYMBOLS:
+            try:
+                evaluate_and_trade(sym)
+            except Exception as e:
+                print(f"[{sym}] ❌ Error in evaluate_and_trade: {e}")
+        print("-" * 60)
+        # continue loop to next candle
