@@ -8,8 +8,8 @@ from binance.client import Client
 from binance.enums import *
 
 # ====== CONFIG ======
-API_KEY = os.getenv("BINANCE_API_KEY") or "" #BINANCE_API_KEY should be replaced with actual api key produced by binance 
-API_SECRET = os.getenv("BINANCE_API_SECRET") or "" #BINANCE_API_SECRET should be replaced with actual binance secrete api key produced by binance
+API_KEY = os.getenv("BINANCE_API_KEY") or ""
+API_SECRET = os.getenv("BINANCE_API_SECRET") or ""
 
 SYMBOLS = ["XRPUSDT", "1000PEPEUSDT"]
 TIMEFRAME = "15m"
